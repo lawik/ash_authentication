@@ -18,7 +18,9 @@ defmodule AshAuthentication.Strategy.WebAuthn.RecentAuthentication do
   The most recent of:
 
   - `opts[:authenticated_at]`: supplied by the caller, as a `DateTime`. The
-    plugs pass the issue time of a bearer token the request carries, and
+    plugs pass the issue time of a bearer token the request carries, once
+    it has verified as the actor's own session token (an unverified token
+    would let anyone holding a stale session claim a fresh sign-in), and
     applications driving `Actions.add_credential/3` directly can pass
     whatever their own session knows.
   - the actor's `:webauthn_verified_at` and `:totp_verified_at` metadata:
@@ -100,14 +102,25 @@ defmodule AshAuthentication.Strategy.WebAuthn.RecentAuthentication do
   end
 
   @doc """
-  The issue time of `token`, when it is a JWT whose subject is `actor`.
-  """
-  @spec token_issued_at(String.t() | nil, Ash.Resource.Record.t() | nil) :: DateTime.t() | nil
-  def token_issued_at(token, actor \\ nil)
+  The issue time of `token`, or `nil`.
 
-  def token_issued_at(token, actor) when is_binary(token) do
-    with {:ok, %{"iat" => iat} = claims} when is_integer(iat) <- Jwt.peek(token),
-         true <- is_nil(actor) or claims["sub"] == AshAuthentication.user_to_subject(actor),
+  With an `actor`, the token is one the caller was handed (a bearer token
+  off a request, say), so it is evidence only if it is genuine: it must
+  verify against the actor's resource (signature, expiry and revocation),
+  be usable as a session credential (purpose `"user"`), and name `actor` as
+  its subject. `opts` takes the `tenant:` the token resource is read in.
+
+  Without an actor the claims are only read, not verified. That is for a
+  token already trusted, such as the one `AshAuthentication.Plug.Helpers`
+  verified and put in the actor's metadata. Never pass it a token taken
+  from a request.
+  """
+  @spec token_issued_at(String.t() | nil, Ash.Resource.Record.t() | nil, keyword) ::
+          DateTime.t() | nil
+  def token_issued_at(token, actor \\ nil, opts \\ [])
+
+  def token_issued_at(token, nil, _opts) when is_binary(token) do
+    with {:ok, %{"iat" => iat}} when is_integer(iat) <- Jwt.peek(token),
          {:ok, at} <- DateTime.from_unix(iat) do
       at
     else
@@ -115,7 +128,19 @@ defmodule AshAuthentication.Strategy.WebAuthn.RecentAuthentication do
     end
   end
 
-  def token_issued_at(_token, _actor), do: nil
+  def token_issued_at(token, %resource{} = actor, opts) when is_binary(token) do
+    with {:ok, %{"iat" => iat, "sub" => subject} = claims, ^resource} when is_integer(iat) <-
+           Jwt.verify(token, resource, Keyword.take(opts, [:tenant])),
+         true <- Map.get(claims, "purpose") in [nil, "user"],
+         true <- Jwt.subject_matches_record?(subject, actor),
+         {:ok, at} <- DateTime.from_unix(iat) do
+      at
+    else
+      _ -> nil
+    end
+  end
+
+  def token_issued_at(_token, _actor, _opts), do: nil
 
   # Session metadata survives as whatever was stored (a `DateTime`), while
   # values that went through JSON (e.g. JWT claims) arrive as ISO 8601.

@@ -436,6 +436,7 @@ defmodule AshAuthentication.Strategy.WebAuthn do
     verify_enabled?: true,
     add_credential_enabled?: true,
     add_credential_max_authentication_age: nil,
+    sign_in_token_lifetime: 60,
     register_action_name: nil,
     register_action_accept: [],
     sign_in_action_name: nil,
@@ -484,6 +485,7 @@ defmodule AshAuthentication.Strategy.WebAuthn do
           add_credential_enabled?: boolean,
           add_credential_max_authentication_age:
             nil | pos_integer | {pos_integer, :days | :hours | :minutes | :seconds},
+          sign_in_token_lifetime: pos_integer,
           register_action_name: atom | nil,
           register_action_accept: [atom | {atom, [secret?: boolean]}],
           sign_in_action_name: atom | nil,

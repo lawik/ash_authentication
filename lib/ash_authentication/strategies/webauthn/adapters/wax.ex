@@ -138,37 +138,46 @@ if Code.ensure_loaded?(Wax) do
     # map it was stored as (string-keyed if the session store went through
     # JSON); `Origin.allowed?/2` reads either form.
     #
-    # The struct is built directly rather than through `Wax.Challenge.new/1`,
-    # so every field Wax verifies against has to be set here: anything left
-    # out silently takes the struct default instead of the strategy's
-    # setting. In particular `user_verification` would fall back to
-    # `"preferred"` (Wax then never checks the UV flag, so `"required"` would
-    # only be a request to the browser) and `timeout` to 120 seconds (cutting
-    # off any ceremony configured to last longer).
+    # The challenge is rebuilt the way it was issued, through Wax's own
+    # constructors, so everything Wax verifies against is set the same way
+    # at both ends: the strategy's settings (without them `user_verification`
+    # would fall back to `"preferred"`, under which Wax never checks the UV
+    # flag, and `timeout` to 120 seconds), and whatever the application
+    # configures for `:wax_` itself (`acceptable_authenticator_statuses`,
+    # `silent_authentication_enabled`, ...), which a struct built by hand
+    # would silently leave at its defaults. Only what identifies the issued
+    # challenge comes from the session: its bytes, its issue time (which the
+    # constructor always sets to now), and the relying party and origin
+    # policy it was issued for.
     defp build_challenge(strategy, data, bytes, rp_id, issued_at, type) do
-      base = %Wax.Challenge{
-        type: type,
+      opts = [
         bytes: bytes,
-        origin: data["origin"] || data[:origin],
-        rp_id: rp_id,
-        issued_at: issued_at,
+        origin: data["origin"] || data[:origin] || :missing,
         origin_verify_fun: @origin_verify_fun,
+        rp_id: rp_id,
         user_verification: strategy.user_verification,
         timeout: Helpers.challenge_timeout_seconds(strategy)
-      }
+      ]
 
-      case type do
-        :attestation ->
-          %{
-            base
-            | attestation: strategy.attestation,
-              trusted_attestation_types: strategy.trusted_attestation_types,
-              verify_trust_root: strategy.verify_trust_root?
-          }
+      challenge =
+        case type do
+          :attestation ->
+            Wax.new_registration_challenge(
+              opts ++
+                [
+                  attestation: strategy.attestation,
+                  trusted_attestation_types: strategy.trusted_attestation_types,
+                  verify_trust_root: strategy.verify_trust_root?
+                ]
+            )
 
-        _ ->
-          %{base | allow_credentials: decode_allow_credentials(data)}
-      end
+          _ ->
+            Wax.new_authentication_challenge(
+              Keyword.put(opts, :allow_credentials, decode_allow_credentials(data))
+            )
+        end
+
+      %{challenge | issued_at: issued_at}
     end
 
     defp decode_allow_credentials(data) do
@@ -183,9 +192,10 @@ if Code.ensure_loaded?(Wax) do
 
     @impl Adapter
     def verify_registration(_strategy, attestation_object, client_data_json, challenge) do
-      {attestation_object, challenge} = for_verification(attestation_object, challenge)
-
-      case Wax.register(attestation_object, client_data_json, challenge) do
+      case safely(fn ->
+             {attestation_object, challenge} = for_verification(attestation_object, challenge)
+             Wax.register(attestation_object, client_data_json, challenge)
+           end) do
         {:ok, {auth_data, _attestation_result}} ->
           cred_data = auth_data.attested_credential_data
 
@@ -201,6 +211,18 @@ if Code.ensure_loaded?(Wax) do
         {:error, _} = error ->
           error
       end
+    end
+
+    # Everything handed to Wax here is the client's: CBOR, JSON and raw
+    # authenticator data that Wax and its decoders pattern-match their way
+    # through, raising on shapes they don't expect (a `clientDataJSON` with
+    # no `type`, truncated authenticator data, ...). On a public endpoint
+    # that is a crash anyone can cause, so a response Wax can't parse is
+    # answered as any other response that doesn't verify.
+    defp safely(fun) do
+      fun.()
+    rescue
+      error -> {:error, %{reason: :malformed_response, message: Exception.message(error)}}
     end
 
     # The strategy's `attestation` is the WebAuthn conveyance preference: what
@@ -226,7 +248,11 @@ if Code.ensure_loaded?(Wax) do
     defp for_verification(attestation_object, %Wax.Challenge{attestation: "none"} = challenge) do
       case CBOR.decode(attestation_object) do
         {:ok, %{"fmt" => fmt, "authData" => auth_data}, _rest} when fmt != "none" ->
-          {none_statement(auth_data), challenge}
+          # Anything but a byte string is left for Wax to refuse.
+          case cbor_bytes(auth_data) do
+            {:ok, bytes} -> {none_statement(bytes), challenge}
+            :error -> {attestation_object, challenge}
+          end
 
         _ ->
           {attestation_object, challenge}
@@ -243,18 +269,18 @@ if Code.ensure_loaded?(Wax) do
       end
     end
 
+    defp cbor_bytes(%CBOR.Tag{tag: :bytes, value: value}) when is_binary(value), do: {:ok, value}
+    defp cbor_bytes(_value), do: :error
+
     defp none_statement(auth_data) do
       %{
         "fmt" => "none",
         "attStmt" => %{},
-        "authData" => %CBOR.Tag{tag: :bytes, value: cbor_bytes(auth_data)}
+        "authData" => %CBOR.Tag{tag: :bytes, value: auth_data}
       }
       |> CBOR.encode()
       |> IO.iodata_to_binary()
     end
-
-    defp cbor_bytes(%CBOR.Tag{tag: :bytes, value: value}), do: value
-    defp cbor_bytes(value) when is_binary(value), do: value
 
     @impl Adapter
     def verify_authentication(
@@ -266,14 +292,16 @@ if Code.ensure_loaded?(Wax) do
           challenge,
           allow_credentials
         ) do
-      case Wax.authenticate(
-             credential_id,
-             authenticator_data,
-             signature,
-             client_data_json,
-             challenge,
-             allow_credentials
-           ) do
+      case safely(fn ->
+             Wax.authenticate(
+               credential_id,
+               authenticator_data,
+               signature,
+               client_data_json,
+               challenge,
+               allow_credentials
+             )
+           end) do
         {:ok, auth_data} ->
           {:ok,
            %{

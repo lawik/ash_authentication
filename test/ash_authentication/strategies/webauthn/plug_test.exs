@@ -251,6 +251,64 @@ defmodule AshAuthentication.Strategy.WebAuthn.PlugTest do
                Base.url_decode64!(body["user"]["id"], padding: false)
     end
 
+    test "subject params that aren't a map are an authentication failure, not a crash", %{
+      strategy: strategy
+    } do
+      challenge_conn = registration_challenge_conn(strategy, "not-a-map@example.com")
+
+      conn =
+        :post
+        |> conn("/user_with_web_authn/webauthn/register", %{"user_with_web_authn" => "nope"})
+        |> SessionPipeline.call([])
+        |> Plug.Conn.put_session(
+          "webauthn_attestation_challenge_webauthn",
+          Plug.Conn.get_session(challenge_conn, "webauthn_attestation_challenge_webauthn")
+        )
+        |> WebAuthn.Plug.register(strategy)
+
+      assert {:error, %AshAuthentication.Errors.AuthenticationFailed{caused_by: caused_by}} =
+               conn.private[:authentication_result]
+
+      assert caused_by.message =~ "base64"
+    end
+
+    test "an attestation object that isn't what it should be is an authentication failure", %{
+      strategy: strategy
+    } do
+      # A statement other than "none" whose authData isn't a byte string:
+      # under `attestation "none"` the adapter rewrites such statements, and
+      # must not trip over this one.
+      malformed =
+        %{"fmt" => "packed", "attStmt" => %{}, "authData" => 42}
+        |> CBOR.encode()
+        |> Base.url_encode64(padding: false)
+
+      for attestation_object <- [malformed, Base.url_encode64(<<0xFF, 0x00>>, padding: false)] do
+        challenge_conn = registration_challenge_conn(strategy, "malformed@example.com")
+
+        conn =
+          :post
+          |> conn("/user_with_web_authn/webauthn/register", %{
+            "user_with_web_authn" => %{
+              "email" => "malformed@example.com",
+              "attestation_object" => attestation_object,
+              "client_data_json" => Base.url_encode64("{}", padding: false)
+            }
+          })
+          |> SessionPipeline.call([])
+          |> Plug.Conn.put_session(
+            "webauthn_attestation_challenge_webauthn",
+            Plug.Conn.get_session(challenge_conn, "webauthn_attestation_challenge_webauthn")
+          )
+          |> WebAuthn.Plug.register(strategy)
+
+        assert {:error, %AshAuthentication.Errors.AuthenticationFailed{caused_by: caused_by}} =
+                 conn.private[:authentication_result]
+
+        refute caused_by.message =~ "challenge in session"
+      end
+    end
+
     test "restrictive trusted_attestation_types rejects untrusted attestation", %{
       strategy: strategy
     } do
@@ -364,6 +422,38 @@ defmodule AshAuthentication.Strategy.WebAuthn.PlugTest do
       assert {:ok, user} = conn.private[:authentication_result]
       assert to_string(user.email) == email
       assert user.__metadata__.token
+    end
+
+    test "an assertion Wax can't parse is an authentication failure, not a crash", %{
+      strategy: strategy
+    } do
+      email = "sign-in-malformed@example.com"
+      passkey = register_passkey(strategy, email)
+      challenge_conn = authentication_challenge_conn(strategy, email)
+      junk = Base.url_encode64("{}", padding: false)
+
+      conn =
+        :post
+        |> conn("/user_with_web_authn/webauthn/sign_in", %{
+          "user_with_web_authn" => %{
+            "raw_id" => passkey.raw_id,
+            "authenticator_data" => Base.url_encode64(<<1, 2, 3>>, padding: false),
+            "signature" => junk,
+            "client_data_json" => junk
+          }
+        })
+        |> SessionPipeline.call([])
+        |> Plug.Conn.put_session(
+          "webauthn_authentication_challenge_webauthn",
+          Plug.Conn.get_session(challenge_conn, "webauthn_authentication_challenge_webauthn")
+        )
+        |> WebAuthn.Plug.sign_in(strategy)
+
+      assert {:error, %AshAuthentication.Errors.AuthenticationFailed{caused_by: caused_by}} =
+               conn.private[:authentication_result]
+
+      refute caused_by.message =~ "challenge in session"
+      refute caused_by.message =~ "Unknown credential"
     end
 
     # Synced passkeys report a constant sign count of 0, so the counter can't

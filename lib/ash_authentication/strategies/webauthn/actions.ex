@@ -236,6 +236,7 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
     tenant = Keyword.get(opts, :tenant)
 
     with :ok <- ensure_enabled(strategy, :verify),
+         :ok <- ensure_own_actor(strategy, :verify, actor),
          {:ok, credential, _user} <-
            run_assertion_ceremony(
              strategy,
@@ -281,8 +282,12 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
     strategy.resource
     |> Query.new()
     |> Query.set_context(action_context(opts[:context], %{private: private}))
-    |> Query.for_read(action_name, arguments)
-    |> Ash.read_one(lookup_ash_opts(strategy, Keyword.get(opts, :tenant)))
+    |> Query.for_read(
+      action_name,
+      arguments,
+      lookup_ash_opts(strategy, Keyword.get(opts, :tenant))
+    )
+    |> Ash.read_one()
     |> case do
       # A user-declared action might not constrain the query to the ceremony
       # user, so the record it returns has to be checked against them.
@@ -383,21 +388,16 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
   # signature verifies: a wrong identity can't be told apart from a wrong
   # signature, by result or by timing, without the credential's private key.
   #
-  # Uses `authorize?: false` (rather than relying on the
-  # `AshAuthenticationInteraction` policy bypass) because the loaded `:user`
-  # relationship triggers a separate `Ash.Query` for the user resource that
-  # doesn't inherit our context, and the WebAuthn ceremony has already
-  # established the caller's identity by virtue of the assertion signature.
+  # Authorised by the `AshAuthenticationInteraction` policy bypass, like every
+  # other read the strategy makes: the context is set under both `private`
+  # and `shared`, and Ash hands `shared` on to the query that loads the user.
   defp lookup_credential_and_user(strategy, raw_id, identity, tenant) do
-    ash_opts = lookup_ash_opts(strategy, tenant)
-
-    strategy.credential_resource
-    |> Query.new()
-    |> Query.set_context(auth_context())
+    strategy
+    |> credential_lookup_query(tenant)
     |> Query.filter(^ref(WebAuthn.credential_id_field(strategy)) == ^raw_id)
     |> calculate_owner_identity_match(strategy, identity)
     |> Query.load(WebAuthn.user_relationship_name(strategy))
-    |> Ash.read_one(ash_opts)
+    |> Ash.read_one()
     |> case do
       {:ok, nil} ->
         {:error, auth_failed(strategy, :sign_in, "Unknown credential")}
@@ -420,15 +420,13 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
   # an attacker from presenting a different user's credential during the
   # second-factor step.
   defp lookup_credential_for_actor(strategy, raw_id, actor, tenant) do
-    ash_opts = lookup_ash_opts(strategy, tenant)
     {foreign_key, actor_id} = user_reference(strategy, actor)
 
-    strategy.credential_resource
-    |> Query.new()
-    |> Query.set_context(auth_context())
+    strategy
+    |> credential_lookup_query(tenant)
     |> Query.filter(^ref(WebAuthn.credential_id_field(strategy)) == ^raw_id)
     |> Query.filter(^ref(foreign_key) == ^actor_id)
-    |> Ash.read_one(ash_opts)
+    |> Ash.read_one()
     |> case do
       {:ok, nil} ->
         {:error, auth_failed(strategy, :verify, "Unknown credential for this user")}
@@ -441,8 +439,20 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
     end
   end
 
+  # A ceremony's credential lookup: the credential resource's own read
+  # action, as the credential management functions use, in the strategy's
+  # context alone.
+  defp credential_lookup_query(strategy, tenant) do
+    action = credential_action_name(strategy.credential_resource, :read_action_name)
+
+    strategy.credential_resource
+    |> Query.new()
+    |> Query.set_context(auth_context())
+    |> Query.for_read(action, %{}, internal_ash_opts(tenant))
+  end
+
   defp lookup_ash_opts(strategy, tenant) do
-    [authorize?: false, domain: Info.domain!(strategy.resource)]
+    [domain: Info.domain!(strategy.resource)]
     |> then(fn opts -> if tenant, do: Keyword.put(opts, :tenant, tenant), else: opts end)
   end
 
@@ -1181,6 +1191,24 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
     end
   end
 
+  # The actor's credentials are found through the strategy's `belongs_to`,
+  # keyed by the actor's primary key. An actor of another resource (an
+  # admin, an API client) would be matched against whichever user happens to
+  # share that key, so only a record of the strategy's own resource can be
+  # verified. `RecentAuthentication.check/3` holds `add_credential` to the
+  # same rule.
+  defp ensure_own_actor(%{resource: resource}, _action, %resource{}), do: :ok
+
+  defp ensure_own_actor(strategy, action, _actor) do
+    {:error,
+     auth_failed(
+       strategy,
+       action,
+       :foreign_actor,
+       "Only a #{inspect(strategy.resource)} can be verified through this strategy"
+     )}
+  end
+
   defp enabled?(strategy, :register), do: strategy.registration_enabled?
   defp enabled?(strategy, :sign_in), do: strategy.sign_in_enabled?
   defp enabled?(strategy, :verify), do: strategy.verify_enabled?
@@ -1265,10 +1293,12 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
     :ok
   end
 
-  defp internal_ash_opts(tenant) do
-    ash_opts = [authorize?: false]
-    if tenant, do: Keyword.put(ash_opts, :tenant, tenant), else: ash_opts
-  end
+  # Options for the strategy's own reads and writes. There is no actor and
+  # nothing turns authorisation off: each of them carries `auth_context/0`,
+  # which the `AshAuthenticationInteraction` bypass on the user and
+  # credential resources recognises.
+  defp internal_ash_opts(nil), do: []
+  defp internal_ash_opts(tenant), do: [tenant: tenant]
 
   defp credential_action_name(credential_resource, field) do
     # These action-name options are declared with defaults in the
@@ -1297,7 +1327,7 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
         |> credential_claims(credential)
         |> Map.put("purpose", "sign_in")
 
-      case Jwt.token_for_user(user, claims, Keyword.take(opts, [:tenant])) do
+      case Jwt.token_for_user(user, claims, sign_in_token_opts(strategy, opts)) do
         {:ok, token, _claims} ->
           {:ok, Ash.Resource.put_metadata(user, :token, token)}
 
@@ -1322,7 +1352,7 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
           "webauthn_verified_at" => DateTime.to_iso8601(verified_at)
         })
 
-      case Jwt.token_for_user(user, claims, Keyword.take(opts, [:tenant])) do
+      case Jwt.token_for_user(user, claims, sign_in_token_opts(strategy, opts)) do
         {:ok, token, _claims} ->
           {:ok, Ash.Resource.put_metadata(user, :token, token)}
 
@@ -1332,6 +1362,16 @@ defmodule AshAuthentication.Strategy.WebAuthn.Actions do
     else
       {:ok, user}
     end
+  end
+
+  # A ceremony's token is only good for one exchange through
+  # `sign_in_with_token`, which follows at once, so it gets the strategy's
+  # short `sign_in_token_lifetime` rather than a session token's, and is
+  # stored (with `store_all_tokens?`) under the purpose its claim states.
+  defp sign_in_token_opts(strategy, opts) do
+    opts
+    |> Keyword.take([:tenant])
+    |> Keyword.merge(token_lifetime: strategy.sign_in_token_lifetime, purpose: :sign_in)
   end
 
   # The claim naming the passkey a token is issued for (see

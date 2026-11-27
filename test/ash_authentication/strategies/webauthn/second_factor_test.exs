@@ -251,6 +251,18 @@ defmodule AshAuthentication.Strategy.WebAuthn.SecondFactorTest do
       assert {:error, %AuthenticationFailed{}} = conn.private[:authentication_result]
     end
 
+    test "refuses an actor that isn't a record of the strategy's resource", %{
+      strategy: strategy
+    } do
+      user = sign_in_with_password("verify-foreign@example.com")
+      # Another resource's record with the same primary key would otherwise
+      # be matched against this user's credentials.
+      foreign_actor = %Example.User{id: user.id}
+
+      assert {:error, %AuthenticationFailed{caused_by: %{reason: :foreign_actor}}} =
+               WebAuthn.Actions.verify(strategy, %{}, actor: foreign_actor, challenge: nil)
+    end
+
     test "rejects an assertion signed over a different challenge", %{strategy: strategy} do
       user = sign_in_with_password("verify-stale@example.com")
       passkey = enrol_passkey(strategy, user)

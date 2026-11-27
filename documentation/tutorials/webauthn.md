@@ -67,6 +67,13 @@ defmodule MyApp.Accounts.WebAuthnCredential do
 end
 ```
 
+The bypass is required once the resource has policies. The strategy reads
+and writes credentials with no actor, and nothing it does turns
+authorisation off: every one of its queries and changesets carries the
+`ash_authentication?` context that this check recognises, as the other
+strategies' do. Without the bypass sign-in is refused, and the generator
+adds it for you. The same goes for the user resource if it has policies.
+
 Then add the strategy to your user resource:
 
 ```elixir
@@ -475,7 +482,8 @@ account through the public `registration_challenge`/`register` endpoints and be
 signed in without the primary factor. With both off, the strategy exposes only
 `verify` and `add_credential`, both of which require an authenticated actor,
 plus `sign_in_with_token`. That one stays because `verify` answers with a
-short-lived sign-in token carrying `webauthn_verified_at`. Exchanging it
+short-lived sign-in token carrying `webauthn_verified_at` (valid for
+`sign_in_token_lifetime`, a minute by default, and for one exchange). Exchanging it
 through `sign_in_with_token` gives a session token that carries the claim. The
 exchange only accepts a valid sign-in token for an existing user, so it signs
 no one in on its own. `mix ash_authentication.add_strategy.webauthn --mode 2fa`
@@ -845,7 +853,10 @@ thought. Two options control it:
   UI should ask them to sign in again or complete a second factor first.
   Signing in, a second-factor verification (`webauthn_verified_at` or
   `totp_verified_at`), or the issue time of the bearer token presented with
-  the request all count; see
+  the request all count. The bearer token counts only once it verifies as
+  that user's own session token (signed, unexpired, unrevoked): the
+  `Authorization` header is the client's to write, so it is never just
+  read. See
   `AshAuthentication.Strategy.WebAuthn.RecentAuthentication`. Unset by
   default, which lets any authenticated session add a passkey.
 
@@ -909,7 +920,20 @@ section is maintained as the implementation evolves.
   high-water mark so a clone keeps tripping the check, and `last_used_at` and
   `backed_up` aren't refreshed for that use either.
 - `user_verification "preferred"` — raise to `"required"` for step-up or
-  high-security deployments.
+  high-security deployments. Consider it for passkey-first too: there the
+  passkey is the only factor, and under `"preferred"` a security key with
+  no PIN set signs in for whoever holds it.
+- `sign_in_token_lifetime {60, :seconds}` — the token `register`, `sign_in`
+  and `verify` answer with is refused as a bearer token and can be exchanged
+  once, through `sign_in_with_token`. It expires after this long whether or
+  not it was exchanged, so one that ends up in a URL or a log is soon
+  worthless.
+- The challenge endpoints are public and each request stores a short-lived
+  challenge token, and nothing in the strategy throttles them. Rate-limit
+  the strategy's routes in your endpoint or proxy as you would a sign-in
+  form.
+- A response the adapter can't parse (malformed CBOR, JSON or authenticator
+  data) is an authentication failure like any other, not an exception.
 - Deleting a user's last credential is refused, so an account with WebAuthn
   as its only strategy cannot lock itself out.
 - Any authenticated session can add a passkey unless

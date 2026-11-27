@@ -322,12 +322,16 @@ defmodule AshAuthentication.Strategy.WebAuthn.Plug do
 
   # A bearer-authenticated actor carries no session token in its metadata,
   # so hand `RecentAuthentication` the issue time of the bearer token the
-  # request presented — provided it was issued to this actor.
+  # request presented, provided it verifies as this actor's session token.
+  # The header is the client's to write, and the actor may have come from
+  # the session instead, so the token is verified here rather than read.
   defp authentication_opts(conn, actor) do
+    opts = Keyword.take(opts(conn), [:tenant])
+
     conn
     |> Conn.get_req_header("authorization")
     |> Enum.find_value(fn
-      "Bearer " <> token -> WebAuthn.RecentAuthentication.token_issued_at(token, actor)
+      "Bearer " <> token -> WebAuthn.RecentAuthentication.token_issued_at(token, actor, opts)
       _ -> nil
     end)
     |> case do
@@ -372,7 +376,7 @@ defmodule AshAuthentication.Strategy.WebAuthn.Plug do
          module: __MODULE__,
          strategy: strategy,
          action: action,
-         message: "An authenticated user is required to add a credential"
+         message: "An authenticated user is required"
        }
      )}
   end
@@ -473,7 +477,10 @@ defmodule AshAuthentication.Strategy.WebAuthn.Plug do
       |> Info.authentication_subject_name!()
       |> to_string()
 
-    Map.get(conn.params, subject_name, %{})
+    case Map.get(conn.params, subject_name) do
+      params when is_map(params) and not is_struct(params) -> params
+      _ -> %{}
+    end
   end
 
   defp opts(conn) do
@@ -599,26 +606,26 @@ defmodule AshAuthentication.Strategy.WebAuthn.Plug do
     end)
   end
 
+  # Authorised by the `AshAuthenticationInteraction` bypass on the
+  # credential resource, as the strategy's other reads are.
   defp load_actor_credentials(strategy, actor, tenant) do
-    ash_opts = [authorize?: false]
+    ash_opts = [
+      context: %{
+        private: %{ash_authentication?: true},
+        shared: %{private: %{ash_authentication?: true}}
+      }
+    ]
+
     ash_opts = if tenant, do: Keyword.put(ash_opts, :tenant, tenant), else: ash_opts
 
     case Ash.load(actor, [strategy.credentials_relationship_name], ash_opts) do
       {:ok, loaded} ->
         Map.get(loaded, strategy.credentials_relationship_name, [])
 
-      _ ->
+      {:error, error} ->
+        Logger.warning("WebAuthn actor-credential lookup failed: #{Exception.message(error)}")
+
         []
     end
-  rescue
-    error in [
-      Ash.Error.Invalid,
-      Ash.Error.Forbidden,
-      Ash.Error.Framework,
-      Ash.Error.Unknown
-    ] ->
-      Logger.warning("WebAuthn actor-credential lookup failed: #{Exception.message(error)}")
-
-      []
   end
 end

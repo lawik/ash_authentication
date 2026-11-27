@@ -343,6 +343,23 @@ defmodule AshAuthentication.Strategy.WebAuthn.Dsl do
           """,
           default: true
         ],
+        sign_in_token_lifetime: [
+          type:
+            {:or,
+             [
+               :pos_integer,
+               {:tuple, [:pos_integer, {:in, [:days, :hours, :minutes, :seconds]}]}
+             ]},
+          default: {60, :seconds},
+          doc: """
+          How long the sign-in token a ceremony answers with stays valid
+          (seconds, or e.g. `{2, :minutes}`). `register`, `sign_in` and
+          `verify` answer with a token that can only be exchanged, once,
+          through `sign_in_with_token`; the exchange normally follows within
+          a second or two, so keep this short. It does not affect the
+          lifetime of the session token the exchange gives.
+          """
+        ],
         add_credential_max_authentication_age: [
           type:
             {:or,
@@ -380,7 +397,7 @@ defmodule AshAuthentication.Strategy.WebAuthn.Dsl do
              {:or, [:atom, {:tuple, [:atom, {:keyword_list, [secret?: [type: :boolean]]}]}]}},
           default: [],
           doc:
-            "A list of additional writable attributes to be accepted in the register action (e.g. `[:name]`). Their values are validated by the action as usual, so `allow_nil?`, constraints, and any validations on the resource apply. Attributes marked `sensitive?: true` must confirm whether they are secrets via a `{field, secret?: boolean}` entry (e.g. `[given_names: [secret?: false]]`); `secret?: true` renders a masked input, `secret?: false` a regular one.",
+            "A list of additional writable attributes to be accepted in the register action (e.g. `[:name]`). Their values are validated by the action as usual, so `allow_nil?`, constraints, and any validations on the resource apply. Attributes marked `sensitive?: true` must confirm whether they are secrets via a `{field, secret?: boolean}` entry (e.g. `[given_names: [secret?: false]]`); the strategy itself only records the answer, which a UI layer such as `ash_authentication_phoenix` uses to render a masked input for `secret?: true` and a regular one for `secret?: false`.",
           required: false
         ],
         sign_in_action_name: [

@@ -212,6 +212,57 @@ defmodule AshAuthentication.Strategy.WebAuthn.AddCredentialGatingTest do
       assert {:error, %AuthenticationFailed{}} = challenge_conn.private[:authentication_result]
     end
 
+    test "a forged bearer token naming the actor does not", %{strategy: strategy} do
+      strategy = %{strategy | add_credential_max_authentication_age: {5, :minutes}}
+      user = "bearer-forged@example.com" |> sign_in_with_password() |> strip_metadata()
+
+      forged = unsigned_token(age: 0, sub: AshAuthentication.user_to_subject(user))
+
+      challenge_conn =
+        add_credential_challenge_conn(strategy, user, fn conn ->
+          Plug.Conn.put_req_header(conn, "authorization", "Bearer " <> forged)
+        end)
+
+      assert {:error, %AuthenticationFailed{caused_by: %{reason: :stale}}} =
+               challenge_conn.private[:authentication_result]
+    end
+
+    test "a revoked bearer token does not", %{strategy: strategy} do
+      strategy = %{strategy | add_credential_max_authentication_age: {5, :minutes}}
+      signed_in = sign_in_with_password("bearer-revoked@example.com")
+      token = signed_in.__metadata__.token
+
+      :ok =
+        AshAuthentication.TokenResource.revoke(
+          Info.authentication_tokens_token_resource!(@resource),
+          token
+        )
+
+      challenge_conn =
+        add_credential_challenge_conn(strategy, strip_metadata(signed_in), fn conn ->
+          Plug.Conn.put_req_header(conn, "authorization", "Bearer " <> token)
+        end)
+
+      assert {:error, %AuthenticationFailed{caused_by: %{reason: :stale}}} =
+               challenge_conn.private[:authentication_result]
+    end
+
+    test "a sign-in token presented as a bearer token does not", %{strategy: strategy} do
+      strategy = %{strategy | add_credential_max_authentication_age: {5, :minutes}}
+      user = "bearer-purpose@example.com" |> sign_in_with_password() |> strip_metadata()
+
+      {:ok, token, _claims} =
+        AshAuthentication.Jwt.token_for_user(user, %{"purpose" => "sign_in"}, purpose: :sign_in)
+
+      challenge_conn =
+        add_credential_challenge_conn(strategy, user, fn conn ->
+          Plug.Conn.put_req_header(conn, "authorization", "Bearer " <> token)
+        end)
+
+      assert {:error, %AuthenticationFailed{caused_by: %{reason: :stale}}} =
+               challenge_conn.private[:authentication_result]
+    end
+
     test "the action enforces it too, with an explicit authenticated_at", %{strategy: strategy} do
       strategy = %{strategy | add_credential_max_authentication_age: {5, :minutes}}
       user = "action@example.com" |> sign_in_with_password() |> strip_metadata()
@@ -286,7 +337,10 @@ defmodule AshAuthentication.Strategy.WebAuthn.AddCredentialGatingTest do
   # A JWT-shaped token issued `age` seconds ago. `RecentAuthentication` only
   # peeks at its claims, so it needn't be signed.
   defp unsigned_token(opts) do
-    claims = %{"iat" => System.system_time(:second) - Keyword.fetch!(opts, :age)}
+    claims =
+      %{"iat" => System.system_time(:second) - Keyword.fetch!(opts, :age)}
+      |> then(&if(opts[:sub], do: Map.put(&1, "sub", opts[:sub]), else: &1))
+
     segment = &Base.url_encode64(Jason.encode!(&1), padding: false)
     "#{segment.(%{"alg" => "HS256", "typ" => "JWT"})}.#{segment.(claims)}.signature"
   end

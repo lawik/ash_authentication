@@ -31,6 +31,14 @@ defmodule AshAuthentication.Strategy.WebAuthn.Transformer do
              &build_credentials_relationship(&1, strategy)
            ),
          :ok <- validate_credentials_relationship(strategy, dsl_state),
+         # Kept as whole seconds (not the Password strategy's tuple) so that
+         # `AshAuthentication.GenerateTokenChange`, which the register action
+         # runs, applies it to the sign-in token it issues.
+         strategy <- %{
+           strategy
+           | sign_in_token_lifetime:
+               AshAuthentication.Utils.lifetime_to_seconds(strategy.sign_in_token_lifetime)
+         },
          strategy <-
            maybe_set_field_lazy(strategy, :register_action_name, &:"register_with_#{&1.name}"),
          strategy <-
